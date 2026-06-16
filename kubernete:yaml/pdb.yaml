@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDistributionBudget
+metadata:
+  name: cluster-app-pdb
+spec:
+  minAvailable: 4
+
+  selector:
+    matchLabels:
+      app: app

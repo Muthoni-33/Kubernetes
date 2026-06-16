@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: app
+  strategy:     # In the case of an update, there will be no downtime.
+     type: RollingUpdate
+     rollingUpdate:
+       maxUnavailable: 0
+       maxSurge: 5
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      affinity:  # Ensures all pods don't land in the same node, in-case the node goes down there is no downtime
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: app
+              topologyKey: kubernetes.io/hostname
+      dnsPolicy: ClusterFirst
+      dnsConfig:          #This block is for pods that communication is with external/Internet api reducing Dns stack up
+        options:
+          - name: ndots
+            value: "2"
+      containers:
+        - name: cont01
+          image: wamenju/maitho
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 2500
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: BD_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: secret
+                  key: Username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: secret
+                  key: Password
+          resources:
+            requests:
+              cpu: 300m
+              memory: 500Mi
+            limits:
+              cpu: 500m
+              memory: 800Mi
+          startupProbe:
+            httpGet:
+              path: /health/start
+              port: 2500
+            failureThreshold: 30
+            periodSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 2500
+            periodSeconds: 3
+            timeoutSeconds: 6
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 2500
+            periodSeconds: 3
+            timeoutSeconds: 6
+          volumeMounts:
+            - name: storage
+              mountPath: /data
+      Volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: pvc
