@@ -1,0 +1,147 @@
+name: Wamenju Project
+
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+
+  set-up:
+    runs-on: ubuntu-latest
+
+    outputs:
+      ENV_NAME: ${{ steps.setenv.outputs.ENV_NAME }}
+
+    steps:
+      - name: Determine Environment
+        id: setenv
+        run: |
+          echo "Branch: $GITHUB_REF_NAME"
+
+          if [[ "$GITHUB_REF_NAME" == "dev" ]]; then
+            echo "ENV_NAME=dev" >> $GITHUB_OUTPUT
+
+          elif [[ "$GITHUB_REF_NAME" == "staging" ]]; then
+            echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+
+          else
+            echo "ENV_NAME=prod" >> $GITHUB_OUTPUT
+          fi
+  
+
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service: [auth]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Test
+        run: mvn test
+        working-directory: services/${{ matrix.service }}
+
+      - name: Package
+        run: mvn package
+        working-directory: services/${{ matrix.service }}
+
+      - name: Setup Docker Buildx
+        uses: |
+          docker/setup-qemu-action@v3
+          docker/setup-buildx-action@v3
+
+      - name: Login to Docker Registry
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      - name: Build and Push Image
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }} \
+            --push \
+            services/${{ matrix.service }}
+  
+
+  deploy:
+    runs-on: ubuntu-latest
+
+    needs:
+      - build
+      - set-up
+
+    env:
+      ENV_NAME: ${{ needs.set-up.outputs.ENV_NAME }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Configure kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region eu-central-1 \
+            --name student-eks-${ENV_NAME}
+      
+
+      - name: Deploy to DEV
+        if: env.ENV_NAME == 'dev'
+        run: |
+          kubectl set image deployment/auth \
+            auth=${{ secrets.DOCKER_USERNAME }}/auth:${{ github.sha }}
+
+          kubectl apply -f k8s/dev/
+      
+
+      - name: Deploy to STAGING
+        if: env.ENV_NAME == 'staging'
+        run: |
+          kubectl set image deployment/auth \
+            auth=${{ secrets.DOCKER_USERNAME }}/auth:${{ github.sha }}
+
+          kubectl apply -f k8s/staging/
+      
+
+      - name: Update Production Manifests
+        if: env.ENV_NAME == 'prod'
+        run: |
+          for svc in auth; do
+            sed -i "s|image: .*/$svc:.*|image: ${{ secrets.DOCKER_USERNAME }}/$svc:${{ github.sha }}|g" \
+              k8s/prod/$svc-deployment.yaml
+          done
+
+      - name: Commit and Push Production Changes
+        if: env.ENV_NAME == 'prod'
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+
+          git add k8s/prod/
+
+          git commit -m "Update production images" || echo "No changes"
+          git  set-url origin https://github.com/Muthoni-33/MP-Tracking.git
+
+          git push origin main
