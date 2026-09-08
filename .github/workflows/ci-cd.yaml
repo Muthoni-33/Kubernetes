@@ -1,147 +1,283 @@
-name: Wamenju Project
-
+##Combination of one Pipeline for the three environments: Dev,Staging and Production
+name: Wamenju Mastery
 on:
   push:
     branches:
       - dev
       - staging
-      - main
+      - production
   pull_request:
     branches:
-      - main
+      - staging
+      - production
+permissions:
+  contents: write
+  packages: write
+  security-events: write
+  attestations: write
+  id-token: write
 
 jobs:
-
-  set-up:
+  set-env:
+    name: Determining the environment
     runs-on: ubuntu-latest
-
     outputs:
-      ENV_NAME: ${{ steps.setenv.outputs.ENV_NAME }}
-
+      Environment: ${{steps.env.outputs.Environment}}
     steps:
-      - name: Determine Environment
-        id: setenv
+      - name: Env
+        id: env
         run: |
-          echo "Branch: $GITHUB_REF_NAME"
-
-          if [[ "$GITHUB_REF_NAME" == "dev" ]]; then
-            echo "ENV_NAME=dev" >> $GITHUB_OUTPUT
-
-          elif [[ "$GITHUB_REF_NAME" == "staging" ]]; then
-            echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
-
-          else
-            echo "ENV_NAME=prod" >> $GITHUB_OUTPUT
+          BRANCH=${{github.ref_name}}
+          echo "Current Branch in use is $BRANCH"
+          if [ "$BRANCH" = "dev" ]; then
+           echo "Environment=dev" >> $GITHUB_OUTPUTS
+          elif [ "$BRANCH" = "staging" ]; then
+           echo "Environment=staging" >> $GITHUB_OUTPUTS
+          else ;
+           echo "Environment=production" >> $GITHUB_OUTPUTS
           fi
-  
-
   build:
+    name: Build Artifact and Image with the necessary security scans
     runs-on: ubuntu-latest
-
+    needs: set-env
+    environment: ${{needs.set-env.outputs.environment}}
     strategy:
       matrix:
-        service: [auth]
-
+        services:
+          - login
+          - announcement
+          - results
+          - fees
+    defaults:
+      run:
+        working-directory: service/${{matrix.services}}
     steps:
-      - name: Checkout Code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - name: setup node
+        uses: actions/setup-node@v4
         with:
-          distribution: temurin
-          java-version: "17"
-          cache: maven
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
 
-      - name: Test
-        run: mvn test
-        working-directory: services/${{ matrix.service }}
-
-      - name: Package
-        run: mvn package
-        working-directory: services/${{ matrix.service }}
-
-      - name: Setup Docker Buildx
-        uses: |
-          docker/setup-qemu-action@v3
-          docker/setup-buildx-action@v3
-
-      - name: Login to Docker Registry
+      - name: Install Dependencies
         run: |
-          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          npm ci
 
-      - name: Build and Push Image
+      - name: security scan
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Dependency Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: services/${{ matrix.service }}
+
+      - name: Unit Test
         run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            -t ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }} \
-            --push \
-            services/${{ matrix.service }}
-  
+          npm test
 
-  deploy:
-    runs-on: ubuntu-latest
+      - name: Integration Test
+        run: |
+          npm run test: Integration
 
+      - name: Build artifact
+        run: |
+          npm run build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.service }}
+          path: services/${{ matrix.service }}/dist/
+
+      - name: Iac Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: setup Qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: Dockerhub Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and upload Image
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          file: services/${{ matrix.service }}/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Container Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Image
+        run: |
+          
+          cosign sign --yes \
+          ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
+
+      - name: Generate Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}
+          subject-digest: |
+            ${{ steps.docker-build.outputs.digest }}
+          push-to-registry: true
+
+  deploy-dev-staging:
+    name: Deploy to Development & Staging
     needs:
+      - set-env
       - build
-      - set-up
-
-    env:
-      ENV_NAME: ${{ needs.set-up.outputs.ENV_NAME }}
-
+    runs-on: ubuntu-latest
+    if: |
+      needs.set-env.outputs.environment == 'development' ||
+      needs.set-env.outputs.environment == 'staging'
+    strategy:
+      matrix:
+        services:
+          - login
+          - announcement
+          - results
+          - fees
+    environment: ${{ needs.set-env.outputs.environment }}
     steps:
-      - name: Checkout Repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-central-1
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActions-Staging
+          aws-region: us-east-1
 
       - name: Configure kubeconfig
         run: |
           aws eks update-kubeconfig \
-            --region eu-central-1 \
-            --name student-eks-${ENV_NAME}
-      
+          --name ${{ secrets.EKS_CLUSTER_NAME }} \
+          --region us-east-1
 
-      - name: Deploy to DEV
-        if: env.ENV_NAME == 'dev'
+      - name: Update Deployment Image
         run: |
-          kubectl set image deployment/auth \
-            auth=${{ secrets.DOCKER_USERNAME }}/auth:${{ github.sha }}
+          
+          kubectl set image \
+          deployment/${{ matrix.service }} \
+          ${{ matrix.service }}=${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}:${{ github.sha }}
 
-          kubectl apply -f k8s/dev/
-      
-
-      - name: Deploy to STAGING
-        if: env.ENV_NAME == 'staging'
+      - name: Verify Rollout
         run: |
-          kubectl set image deployment/auth \
-            auth=${{ secrets.DOCKER_USERNAME }}/auth:${{ github.sha }}
+          kubectl rollout status \
+          deployment/${{ matrix.service }} \
+          --timeout=300s
 
-          kubectl apply -f k8s/staging/
-      
-
-      - name: Update Production Manifests
-        if: env.ENV_NAME == 'prod'
+      - name: Health Check
         run: |
-          for svc in auth; do
-            sed -i "s|image: .*/$svc:.*|image: ${{ secrets.DOCKER_USERNAME }}/$svc:${{ github.sha }}|g" \
-              k8s/prod/$svc-deployment.yaml
-          done
+          kubectl wait \
+          deployment/${{ matrix.service }} \
+          --for=condition=available \
+          --timeout=300s
 
-      - name: Commit and Push Production Changes
-        if: env.ENV_NAME == 'prod'
+      - name: Rollback
+        if: failure()
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
+          kubectl rollout undo \
+          deployment/${{ matrix.service }}
 
-          git add k8s/prod/
+      - name: Verify Rollback
+        if: failure()
+        run: |
+          kubectl rollout status \
+          deployment/${{ matrix.service }}
+          
+  deploy-production:
+    name: Deploy Production
+    needs:
+      - set-env
+      - build
+    runs-on: ubuntu-latest
+    if: needs.set-env.outputs.environment == 'production'
 
-          git commit -m "Update production images" || echo "No changes"
-          git  set-url origin https://github.com/Muthoni-33/MP-Tracking.git
+    environment:
+      name: production
+    strategy:
+      matrix:
+        services:
+          - login
+          - announcement
+          - results
+          - fees
+    steps:
+      - name: Checkout GitOps Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Wamenju/student-portal-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
 
+      - name: Install yq
+        uses: mikefarah/yq@v4
+
+      - name: Update Helm Values
+        run: |
+          yq -i '
+          .image.repository="${{ secrets.DOCKER_USERNAME }}/${{ matrix.service }}" |
+          .image.tag="${{ github.sha }}"
+          ' \
+          gitops/apps/${{ matrix.service }}/values.yaml
+      - name: Commit Changes
+        run: |
+          cd gitops
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Deploy ${{ matrix.service }} ${{ github.sha }}" || echo "No changes"
+      - name: Push Changes
+        run: |
+          cd gitops
           git push origin main
+      - name: Wait For ArgoCD Sync
+        run: |
+          sleep 60
+
+      - name: Verify Production
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsDeployRole
+          aws-region: us-east-1
+
+      - run: |
+          aws eks update-kubeconfig \
+          --name ${{ secrets.EKS_CLUSTER_NAME }} \
+          --region us-east-1
+          
+          kubectl rollout status deployment/${{ matrix.service }}

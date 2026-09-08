@@ -19,10 +19,12 @@ spec:
     spec:
       affinity:  # Ensures all pods don't land in the same node, in-case the node goes down there is no downtime
         podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app: app
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerms:
+              - labelSelector:
+                  matchLabels:
+                    app: app
               topologyKey: kubernetes.io/hostname
       dnsPolicy: ClusterFirst
       dnsConfig:          #This block is for pods that communication is with external/Internet api reducing Dns stack up
